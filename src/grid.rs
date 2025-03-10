@@ -11,7 +11,7 @@ use std::{
 use ahash::{AHashMap, AHashSet, AHasher};
 use parse::parse_grid;
 use rand::distr::{Distribution, StandardUniform};
-use ustr::{Ustr, UstrMap};
+use ustr::{ustr, Ustr, UstrMap};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cell {
@@ -164,6 +164,13 @@ impl Grid {
         }
     }
 
+    pub fn count(&self, kind: impl Into<Ustr>) -> usize {
+        self.inverse
+            .get(&kind.into())
+            .map(|l| l.len())
+            .unwrap_or_default()
+    }
+
     pub fn get(&self, x: usize, y: usize) -> Option<&Cell> {
         if x >= self.width || y >= self.height {
             return None;
@@ -274,6 +281,10 @@ impl Grid {
 
                 let new = stamp.cells[i + j * stamp.width];
                 let old = &mut self.cells[x + y * self.width];
+
+                if new.kind.is_empty() {
+                    continue;
+                }
 
                 if new.kind != old.kind {
                     changed = true;
