@@ -10,7 +10,10 @@ use std::{
 
 use ahash::{AHashMap, AHashSet, AHasher};
 use parse::parse_grid;
-use rand::distr::{Distribution, StandardUniform};
+use rand::{
+    distr::{Distribution, StandardUniform},
+    Rng,
+};
 use ustr::{ustr, Ustr, UstrMap};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -155,6 +158,11 @@ impl Grid {
         self.height
     }
 
+    pub fn add_caches(&mut self, width: usize, height: usize) {
+        self.add_cache(width, height);
+        self.add_cache(height, width);
+    }
+
     pub fn add_cache(&mut self, width: usize, height: usize) {
         if !self.caches.contains_key(&(width, height)) {
             self.caches.insert(
@@ -265,6 +273,253 @@ impl Grid {
         }
     }
 
+    pub fn replace(&mut self, old: impl Into<Ustr>, new: impl Into<Ustr>) -> usize {
+        let old = old.into();
+        let new = new.into();
+
+        let Some(locations) = self.inverse.remove(&old) else {
+            return 0;
+        };
+
+        let new_locations = self.inverse.entry(new).or_default();
+
+        let replaced = locations.len();
+
+        let mut min_x = self.width;
+        let mut min_y = self.height;
+        let mut max_x = 0;
+        let mut max_y = 0;
+
+        for (x, y) in locations.into_iter() {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+
+            new_locations.insert((x, y));
+
+            self.cells[x + y * self.width].kind = new;
+        }
+
+        self.update_cache(min_x, min_y, max_x, max_y);
+
+        replaced
+    }
+
+    /// Hill climbs to largest sum of raycast in each cardinal direction.
+    ///
+    /// Returns (maximum, [neg_x, neg_y, pos_x, pos_y])
+    pub fn open_area(&self, mut x: usize, mut y: usize) -> ((usize, usize), [usize; 4]) {
+        let Some(cell) = self.get(x, y) else {
+            return ((x, y), [0; 4]);
+        };
+
+        let kind = cell.kind;
+
+        let mut last = (x, y);
+
+        let mut pos_x = 0;
+        let mut pos_y = 0;
+        let mut neg_x = 0;
+        let mut neg_y = 0;
+
+        for x in (x + 1)..self.width {
+            if self.get(x, y).unwrap().kind == kind {
+                pos_x += 1;
+            } else {
+                break;
+            }
+        }
+
+        for x in (0..x).rev() {
+            if self.get(x, y).unwrap().kind == kind {
+                neg_x += 1;
+            } else {
+                break;
+            }
+        }
+
+        for y in (y + 1)..self.height {
+            if self.get(x, y).unwrap().kind == kind {
+                pos_y += 1;
+            } else {
+                break;
+            }
+        }
+
+        for y in (0..y).rev() {
+            if self.get(x, y).unwrap().kind == kind {
+                neg_y += 1;
+            } else {
+                break;
+            }
+        }
+
+        let mut total = pos_x + pos_y + neg_x + neg_y;
+        let mut same_for = 0;
+
+        loop {
+            let max = pos_x.max(pos_y).max(neg_x).max(neg_y);
+
+            if pos_x == max || neg_x == max {
+                x = if pos_x > neg_x { x + 1 } else { x - 1 };
+
+                pos_y = 0;
+                neg_y = 0;
+
+                for y in (y + 1)..self.height {
+                    if self.get(x, y).unwrap().kind == kind {
+                        pos_y += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                for y in (0..y).rev() {
+                    if self.get(x, y).unwrap().kind == kind {
+                        neg_y += 1;
+                    } else {
+                        break;
+                    }
+                }
+            } else if pos_y == max || neg_y == max {
+                y = if pos_y > neg_y { y + 1 } else { y - 1 };
+
+                pos_x = 0;
+                neg_x = 0;
+
+                for x in (x + 1)..self.width {
+                    if self.get(x, y).unwrap().kind == kind {
+                        pos_x += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                for x in (0..x).rev() {
+                    if self.get(x, y).unwrap().kind == kind {
+                        neg_x += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            let new_total = pos_x + pos_y + neg_x + neg_y;
+
+            if total == new_total {
+                same_for += 1;
+            } else {
+                same_for = 0;
+            }
+
+            if total > new_total || same_for > 2 {
+                return (last, [neg_x, neg_y, pos_x, pos_y]);
+            }
+
+            last = (x, y);
+            total = new_total;
+        }
+    }
+
+    pub fn decompose(
+        &self,
+        rng: &mut impl Rng,
+        kind: impl Into<Ustr>,
+        first: Option<usize>,
+    ) -> Vec<((usize, usize), (usize, usize))> {
+        let kind = kind.into();
+        let mut rectangles = Vec::new();
+
+        let Some(locations) = self.inverse.get(&kind) else {
+            return rectangles;
+        };
+
+        let mut accounted_set = AHashSet::new();
+        let mut unaccounted: Vec<_> = locations.iter().copied().collect();
+
+        let mut possible_directions = Vec::new();
+
+        let mut added = Vec::new();
+
+        while !unaccounted.is_empty() {
+            let (x, y) = unaccounted.swap_remove(rng.random_range(0..unaccounted.len()));
+
+            if accounted_set.contains(&(x, y)) {
+                continue;
+            }
+
+            let mut min_x = x;
+            let mut min_y = y;
+            let mut max_x = x;
+            let mut max_y = y;
+
+            let mut rectangle = ((min_x, min_y), (max_x, max_y));
+
+            added.clear();
+            possible_directions.clear();
+
+            possible_directions.extend([
+                Direction::North,
+                Direction::East,
+                Direction::South,
+                Direction::West,
+            ]);
+
+            'expand: loop {
+                if possible_directions.is_empty() {
+                    break;
+                }
+
+                let direction_index = rng.random_range(0..possible_directions.len());
+
+                match possible_directions[direction_index] {
+                    Direction::East => {
+                        max_x = (max_x + 1).min(self.width - 1);
+                        added.extend((min_y..=max_y).map(|y| (max_x, y)));
+                    }
+                    Direction::South => {
+                        max_y = (max_y + 1).min(self.height - 1);
+                        added.extend((min_x..=max_x).map(|x| (x, max_y)));
+                    }
+                    Direction::West => {
+                        min_x = min_x.saturating_sub(1);
+                        added.extend((min_y..=max_y).map(|y| (min_x, y)));
+                    }
+                    Direction::North => {
+                        min_y = min_y.saturating_sub(1);
+                        added.extend((min_x..=max_x).map(|x| (x, min_y)));
+                    }
+                };
+
+                for (x, y) in added.iter() {
+                    if accounted_set.contains(&(*x, *y))
+                        || self.cells[x + y * self.width].kind != kind
+                    {
+                        possible_directions.swap_remove(direction_index);
+                        ((min_x, min_y), (max_x, max_y)) = rectangle;
+                        added.clear();
+                        continue 'expand;
+                    }
+                }
+
+                accounted_set.extend(added.drain(..));
+
+                rectangle = ((min_x, min_y), (max_x, max_y));
+            }
+
+            rectangles.push(rectangle);
+
+            if let Some(first) = first {
+                if rectangles.len() >= first {
+                    return rectangles;
+                }
+            }
+        }
+
+        rectangles
+    }
+
     pub fn place(&mut self, x: usize, y: usize, direction: Direction, stamp: &Grid) {
         let mut changed = false;
 
@@ -353,7 +608,7 @@ impl Grid {
         matches: &mut Vec<(usize, usize, Direction)>,
         direction: Direction,
     ) -> usize {
-        let pattern_size = (pattern.width, pattern.height);
+        let pattern_size = direction.apply_size(pattern.width, pattern.height);
 
         if let Some(cache) = self.caches.get(&pattern_size) {
             let pattern_hash = pattern.kind_hash(direction);
